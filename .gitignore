@@ -1,0 +1,10 @@
+private/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.ipynb_checkpoints/
+.env
+.DS_Store
+Thumbs.db
+~$*
