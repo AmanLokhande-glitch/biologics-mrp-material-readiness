@@ -23,6 +23,6 @@
 
    ## Synthetic scope
    - 60 materials (22 raw/process, 23 single-use, 15 packaging), 14 suppliers, 4 production programs
-   - Planning period Jan 5 - Jun 28, 2026, in 26 weekly buckets
+   - Planning period Jan 5 - Jul 5, 2026, in 26 weekly buckets
    - About 150 PO lines and 130-180 inventory batches
    - Stock types: UNRESTRICTED, QUALITY_INSPECTION, BLOCKED

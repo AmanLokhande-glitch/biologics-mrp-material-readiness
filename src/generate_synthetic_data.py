@@ -1,13 +1,16 @@
 """
 generate_synthetic_data.py
 
-Build step 1: create the master data for the fictional company
-"Northstar Biologics Manufacturing".
+Build steps 1-2: create the master data and the weekly manufacturing
+requirements for the fictional company "Northstar Biologics Manufacturing".
 
-This script writes two CSV files:
-    data/raw/supplier_master.csv  -> 14 fictional suppliers
-    data/raw/material_master.csv  -> 60 materials (22 raw/process,
-                                     23 single-use, 15 packaging)
+This script writes three CSV files:
+    data/raw/supplier_master.csv     -> 14 fictional suppliers
+    data/raw/material_master.csv     -> 60 materials (22 raw/process,
+                                        23 single-use, 15 packaging)
+    data/raw/weekly_requirements.csv -> 60 materials x 26 weeks = 1,560 rows
+                                        of gross requirements, driven by a
+                                        campaign production schedule
 
 The columns follow section 6 of the project plan. They mirror SAP-style
 material planning parameters (procurement type, planned delivery time,
@@ -21,6 +24,7 @@ Run from the project folder:
     python src/generate_synthetic_data.py
 """
 
+import math
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +56,10 @@ MATERIAL_COLUMNS = [
     "criticality", "sole_source_flag", "unit_cost",
     "shelf_life_days", "storage_condition",  # extra columns
 ]
+REQUIREMENT_COLUMNS = [
+    "material_id", "week_start", "gross_requirement_qty", "requirement_type",
+    "production_program", "priority",
+]
 
 # Allowed values for the coded fields.
 ALLOWED_REGIONS = {"NORTH_AMERICA", "EUROPE", "ASIA_PACIFIC"}
@@ -72,6 +80,14 @@ ALLOWED_LOT_SIZE_RULES = {"EX", "FX", "MB"}
 # Material planned delivery time may differ from the supplier's standard
 # lead time by at most this many days.
 MAX_LEAD_TIME_GAP_DAYS = 14
+
+# Requirement types:
+#   PRODUCTION       = demand from firm production inside the firm horizon
+#   PLANNED_CAMPAIGN = demand from planned campaigns further out (may change)
+#   SAFETY_STOCK     = no production demand this week (quantity 0); the only
+#                      planning need is to keep safety stock on hand
+ALLOWED_REQUIREMENT_TYPES = {"PRODUCTION", "SAFETY_STOCK", "PLANNED_CAMPAIGN"}
+ALLOWED_PRIORITIES = {"HIGH", "MEDIUM", "LOW"}
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +362,257 @@ def build_material_master(suppliers):
 
 
 # ---------------------------------------------------------------------------
-# 4. Checks: make sure the data is valid before saving
+# 4. Weekly manufacturing requirements (build step 2)
+# ---------------------------------------------------------------------------
+
+# Planning horizon: 26 weekly buckets. Each week starts on a Monday.
+PLANNING_START = pd.Timestamp("2026-01-05")  # a Monday
+N_WEEKS = 26
+
+# Weeks 1-8 are the "firm" horizon: that production is fixed, so its demand
+# is PRODUCTION. Weeks 9-26 are still a plan, so their demand is
+# PLANNED_CAMPAIGN.
+FIRM_HORIZON_WEEKS = 8
+
+# Four fictional production programs (neutral codes, no product names).
+#   stage       -> COMMERCIAL programs get higher priority than CLINICAL ones
+#   scale_l     -> bioreactor size in litres
+#   fill_units  -> units filled in a normal fill/finish week (0 = this program
+#                  is drug substance only and is not filled on site)
+PROGRAMS = {
+    "PROG-01": {"stage": "COMMERCIAL", "scale_l": 2000, "fill_units": 24000},  # lyophilised vial, 10 mL
+    "PROG-02": {"stage": "COMMERCIAL", "scale_l": 2000, "fill_units": 30000},  # prefilled syringe, 1 mL
+    "PROG-03": {"stage": "CLINICAL",   "scale_l": 500,  "fill_units": 18000},  # liquid vial, 2R
+    "PROG-04": {"stage": "CLINICAL",   "scale_l": 500,  "fill_units": 0},      # drug substance only
+}
+
+# Campaign calendar: (program, first week, last week). Week 1 = Jan 5.
+# Biologics plants make one product at a time in long "campaigns", with a
+# cleaning / changeover week between products. So:
+#   - the drug substance (DS) suite runs only one program in any week
+#   - the fill/finish line also runs only one program in any week
+# Week 1 is the start-up week after the year-end shutdown (no production).
+DS_CAMPAIGNS = [
+    ("PROG-01", 2, 6),
+    ("PROG-03", 8, 11),    # week 7 = changeover
+    ("PROG-02", 13, 17),   # week 12 = changeover
+    ("PROG-04", 19, 21),   # week 18 = changeover
+    ("PROG-01", 23, 26),   # week 22 = changeover
+]
+# Filling happens about 3-4 weeks after the drug substance is made (time for
+# QC testing and release). The first PROG-02 fill uses DS made in late 2025.
+FILL_CAMPAIGNS = [
+    ("PROG-02", 3, 4),
+    ("PROG-01", 9, 11),
+    ("PROG-03", 15, 16),
+    ("PROG-02", 21, 23),
+]
+
+ALL_PROGRAMS = ["PROG-01", "PROG-02", "PROG-03", "PROG-04"]
+LARGE_SCALE = ["PROG-01", "PROG-02"]          # 2000 L programs
+SMALL_SCALE = ["PROG-03", "PROG-04"]          # 500 L programs
+FILLED_ON_SITE = ["PROG-01", "PROG-02", "PROG-03"]
+VIAL_PROGRAMS = ["PROG-01", "PROG-03"]
+
+# Simple bill of materials: material_id -> (programs that use it, qty, basis)
+# basis says what the quantity is "per":
+#   PER_BATCH    -> per bioreactor batch, used every DS week
+#   PER_CAMPAIGN -> once, in the first week of a DS campaign (chromatography
+#                   resin is packed into a fresh column per campaign and then
+#                   re-used for every batch in that campaign)
+#   PER_UNIT     -> per unit filled on the fill/finish line (packaging)
+# Raw/process quantities are written for a 2000 L batch and are scaled down
+# for 500 L programs. Single-use parts and packaging are simple counts.
+REQUIREMENT_BOM = {
+    # --- Raw / process materials (per 2000 L batch) ---
+    "RM-001": (ALL_PROGRAMS, 40, "PER_BATCH"),        # basal medium
+    "RM-002": (ALL_PROGRAMS, 120, "PER_BATCH"),       # feed A
+    "RM-003": (LARGE_SCALE, 80, "PER_BATCH"),         # feed B (high-titer processes)
+    "RM-004": (SMALL_SCALE, 40, "PER_BATCH"),         # glutamine (non-GS cell lines)
+    "RM-005": (ALL_PROGRAMS, 2, "PER_BATCH"),         # poloxamer
+    "RM-006": (ALL_PROGRAMS, 1, "PER_BATCH"),         # antifoam
+    "RM-007": (ALL_PROGRAMS, 30, "PER_CAMPAIGN"),     # Protein A resin
+    "RM-008": (["PROG-01", "PROG-02", "PROG-03"], 40, "PER_CAMPAIGN"),  # cation exchange resin
+    "RM-009": (ALL_PROGRAMS, 30, "PER_CAMPAIGN"),     # anion exchange resin
+    "RM-010": (ALL_PROGRAMS, 150, "PER_BATCH"),       # sodium chloride
+    "RM-011": (ALL_PROGRAMS, 60, "PER_BATCH"),        # Tris
+    "RM-012": (ALL_PROGRAMS, 50, "PER_BATCH"),        # sodium acetate
+    "RM-013": (ALL_PROGRAMS, 20, "PER_BATCH"),        # acetic acid
+    "RM-014": (ALL_PROGRAMS, 120, "PER_BATCH"),       # sodium hydroxide (cleaning)
+    "RM-015": (["PROG-02", "PROG-04"], 40, "PER_BATCH"),  # sodium citrate
+    "RM-016": (["PROG-01", "PROG-03"], 50, "PER_BATCH"),  # sodium phosphate
+    "RM-017": (["PROG-01", "PROG-02", "PROG-03"], 6, "PER_BATCH"),  # histidine (formulation)
+    "RM-018": (["PROG-02"], 8, "PER_BATCH"),          # arginine (formulation)
+    "RM-019": (VIAL_PROGRAMS, 60, "PER_BATCH"),       # sucrose (formulation)
+    "RM-020": (ALL_PROGRAMS, 1, "PER_BATCH"),         # polysorbate 80 (formulation)
+    "RM-021": (["PROG-04"], 120, "PER_BATCH"),        # glycine (formulation)
+    "RM-022": (ALL_PROGRAMS, 60, "PER_BATCH"),        # hydrochloric acid
+    # --- Single-use components (count per batch) ---
+    "SU-001": (LARGE_SCALE, 1, "PER_BATCH"),          # 2000 L bioreactor bag
+    "SU-002": (SMALL_SCALE, 1, "PER_BATCH"),          # 500 L bioreactor bag
+    "SU-003": (ALL_PROGRAMS, 1, "PER_BATCH"),         # seed bioreactor bag
+    "SU-004": (ALL_PROGRAMS, 2, "PER_BATCH"),         # mixer bag (media + buffer prep)
+    "SU-005": (ALL_PROGRAMS, 4, "PER_BATCH"),         # media storage bag
+    "SU-006": (ALL_PROGRAMS, 3, "PER_BATCH"),         # buffer storage bag
+    "SU-007": (ALL_PROGRAMS, 6, "PER_BATCH"),         # harvest collection bag
+    "SU-008": (ALL_PROGRAMS, 8, "PER_BATCH"),         # freeze-thaw bag (DS storage)
+    "SU-009": (ALL_PROGRAMS, 6, "PER_BATCH"),         # 0.2 um filter, 10 in
+    "SU-010": (LARGE_SCALE, 3, "PER_BATCH"),          # 0.2 um filter, 30 in
+    "SU-011": (ALL_PROGRAMS, 4, "PER_BATCH"),         # depth filter
+    "SU-012": (ALL_PROGRAMS, 1, "PER_BATCH"),         # virus filter
+    "SU-013": (ALL_PROGRAMS, 2, "PER_BATCH"),         # TFF cassette
+    "SU-014": (ALL_PROGRAMS, 20, "PER_BATCH"),        # aseptic connector
+    "SU-015": (ALL_PROGRAMS, 10, "PER_BATCH"),        # silicone tubing assembly
+    "SU-016": (ALL_PROGRAMS, 8, "PER_BATCH"),         # weldable tubing assembly
+    "SU-017": (ALL_PROGRAMS, 6, "PER_BATCH"),         # sampling manifold
+    "SU-018": (ALL_PROGRAMS, 30, "PER_BATCH"),        # media bottle
+    "SU-019": (ALL_PROGRAMS, 6, "PER_BATCH"),         # transfer line
+    "SU-020": (ALL_PROGRAMS, 3, "PER_BATCH"),         # pH sensor
+    "SU-021": (ALL_PROGRAMS, 3, "PER_BATCH"),         # dissolved oxygen sensor
+    "SU-022": (ALL_PROGRAMS, 6, "PER_BATCH"),         # pressure sensor
+    "SU-023": (ALL_PROGRAMS, 4, "PER_BATCH"),         # conductivity sensor
+    # --- Packaging (per unit filled; 1.02 = 2% line loss, 1.05 = 5% label overage) ---
+    "PK-001": (["PROG-01"], 1.02, "PER_UNIT"),        # 10 mL vial
+    "PK-002": (["PROG-03"], 1.02, "PER_UNIT"),        # 2R vial
+    "PK-003": (["PROG-02"], 1.02, "PER_UNIT"),        # syringe barrel
+    "PK-004": (["PROG-01"], 1.02, "PER_UNIT"),        # 20 mm lyo stopper
+    "PK-005": (["PROG-03"], 1.02, "PER_UNIT"),        # 13 mm stopper
+    "PK-006": (["PROG-02"], 1.02, "PER_UNIT"),        # plunger stopper
+    "PK-007": (["PROG-01"], 1.02, "PER_UNIT"),        # 20 mm seal
+    "PK-008": (["PROG-02"], 1.02, "PER_UNIT"),        # needle shield
+    "PK-009": (["PROG-01"], 1.05, "PER_UNIT"),        # label, strength A
+    "PK-010": (["PROG-03"], 1.05, "PER_UNIT"),        # label, strength B
+    "PK-011": (VIAL_PROGRAMS, 2, "PER_UNIT"),         # carton seal label (2 per carton)
+    "PK-012": (FILLED_ON_SITE, 1, "PER_UNIT"),        # leaflet
+    "PK-013": (VIAL_PROGRAMS, 1, "PER_UNIT"),         # folding carton
+    "PK-014": (VIAL_PROGRAMS, 0.1, "PER_UNIT"),       # vial tray (holds 10)
+    "PK-015": (FILLED_ON_SITE, 1 / 300, "PER_UNIT"),  # cold-chain shipper (holds 300)
+}
+
+
+def build_production_schedule():
+    """
+    Turn the campaign calendar into a week-by-week schedule.
+
+    Returns a dict: week_no -> {
+        "ds_program", "ds_batches", "ds_campaign_start",
+        "fill_program", "fill_units" }
+    """
+    schedule = {
+        week_no: {"ds_program": None, "ds_batches": 0, "ds_campaign_start": False,
+                  "fill_program": None, "fill_units": 0}
+        for week_no in range(1, N_WEEKS + 1)
+    }
+
+    # Drug substance suite: the first week of a campaign runs 1 batch
+    # (ramp-up), later weeks run 1 or 2 batches.
+    for program, first, last in DS_CAMPAIGNS:
+        for week_no in range(first, last + 1):
+            week = schedule[week_no]
+            assert week["ds_program"] is None, f"Two DS campaigns overlap in week {week_no}"
+            week["ds_program"] = program
+            week["ds_campaign_start"] = (week_no == first)
+            week["ds_batches"] = 1 if week_no == first else int(rng.integers(1, 2, endpoint=True))
+
+    # Fill/finish line: the normal weekly output, +/- 10%, rounded to 500 units.
+    for program, first, last in FILL_CAMPAIGNS:
+        for week_no in range(first, last + 1):
+            week = schedule[week_no]
+            assert week["fill_program"] is None, f"Two fill campaigns overlap in week {week_no}"
+            units = PROGRAMS[program]["fill_units"] * rng.uniform(0.9, 1.1)
+            week["fill_program"] = program
+            week["fill_units"] = int(round(units / 500) * 500)
+
+    return schedule
+
+
+def assign_priority(requirement_type, program, criticality):
+    """
+    Priority of one weekly requirement:
+      - a week with no demand (SAFETY_STOCK) is LOW
+      - otherwise score 1 point for a COMMERCIAL program and 1 point for a
+        HIGH-criticality material: 2 points = HIGH, 1 = MEDIUM, 0 = LOW
+    """
+    if requirement_type == "SAFETY_STOCK":
+        return "LOW"
+    points = 0
+    if PROGRAMS[program]["stage"] == "COMMERCIAL":
+        points += 1
+    if criticality == "HIGH":
+        points += 1
+    return {2: "HIGH", 1: "MEDIUM", 0: "LOW"}[points]
+
+
+def build_weekly_requirements(materials, schedule):
+    """Create one row per material per week (60 x 26 = 1,560 rows)."""
+    rows = []
+
+    for material in materials.itertuples():
+        programs, qty, basis = REQUIREMENT_BOM[material.material_id]
+
+        for week_no, week in schedule.items():
+            program = None
+            amount = 0.0
+
+            if basis in ("PER_BATCH", "PER_CAMPAIGN") and week["ds_program"] in programs:
+                program = week["ds_program"]
+                # Raw/process materials scale with bioreactor size
+                # (a 500 L batch uses 1/4 of a 2000 L batch).
+                scale = 1.0
+                if material.material_category == "RAW_PROCESS":
+                    scale = PROGRAMS[program]["scale_l"] / 2000
+                if basis == "PER_BATCH":
+                    amount = qty * week["ds_batches"] * scale
+                elif week["ds_campaign_start"]:
+                    amount = qty * scale
+
+            elif basis == "PER_UNIT" and week["fill_program"] in programs:
+                program = week["fill_program"]
+                amount = qty * week["fill_units"]
+
+            # Round up to a whole unit. (round(..., 6) first removes tiny
+            # floating-point errors, e.g. 24480.000000001 -> 24480.)
+            gross_qty = int(math.ceil(round(amount, 6)))
+
+            if gross_qty == 0:
+                requirement_type = "SAFETY_STOCK"
+                program = None  # filled in below
+            elif week_no <= FIRM_HORIZON_WEEKS:
+                requirement_type = "PRODUCTION"
+            else:
+                requirement_type = "PLANNED_CAMPAIGN"
+
+            rows.append({
+                "material_id": material.material_id,
+                "week_start": PLANNING_START + pd.Timedelta(weeks=week_no - 1),
+                "gross_requirement_qty": gross_qty,
+                "requirement_type": requirement_type,
+                "production_program": program,
+                "criticality": material.criticality,  # helper, dropped below
+            })
+
+    df = pd.DataFrame(rows)
+
+    # Weeks with no demand still need a program code. Use the program whose
+    # campaign this material is waiting for next (that is what its safety
+    # stock is protecting). After the material's last campaign, use the last
+    # program that used it.
+    df["production_program"] = (
+        df.groupby("material_id")["production_program"]
+          .transform(lambda s: s.bfill().ffill())
+    )
+
+    df["priority"] = [
+        assign_priority(rt, prog, crit)
+        for rt, prog, crit in zip(df["requirement_type"], df["production_program"], df["criticality"])
+    ]
+
+    df["week_start"] = df["week_start"].dt.strftime("%Y-%m-%d")
+    return df[REQUIREMENT_COLUMNS]
+
+
+# ---------------------------------------------------------------------------
+# 5. Checks: make sure the data is valid before saving
 # ---------------------------------------------------------------------------
 
 def validate(suppliers, materials):
@@ -430,21 +696,84 @@ def validate(suppliers, materials):
     assert not missing, f"Sole-source supplier(s) with no sole-source material: {missing}"
 
 
+def validate_requirements(requirements, materials):
+    """Stop with an error if the weekly requirements break a basic rule."""
+    req = requirements
+
+    # Every material in the master needs a bill-of-materials entry.
+    assert set(REQUIREMENT_BOM) == set(materials["material_id"]), \
+        "REQUIREMENT_BOM must list exactly the 60 materials"
+
+    # Shape: exactly 60 x 26 rows, the planned columns, nothing missing.
+    assert len(req) == 1560, f"Expected 1,560 rows, got {len(req)}"
+    assert list(req.columns) == REQUIREMENT_COLUMNS, "Requirement columns do not match the plan"
+    assert not req.isna().any().any(), "Missing values in weekly_requirements"
+
+    # One row per material per week.
+    dupes = req.duplicated(subset=["material_id", "week_start"])
+    assert not dupes.any(), f"{dupes.sum()} duplicate material/week pairs"
+
+    # Every material_id exists in the material master, and all 60 appear.
+    unknown = set(req["material_id"]) - set(materials["material_id"])
+    assert not unknown, f"Unknown material_id(s): {unknown}"
+    assert req["material_id"].nunique() == 60, "Not all 60 materials have requirements"
+
+    # The 26 week_start dates are the expected Mondays.
+    expected_weeks = {
+        (PLANNING_START + pd.Timedelta(weeks=i)).strftime("%Y-%m-%d") for i in range(N_WEEKS)
+    }
+    assert set(req["week_start"]) == expected_weeks, "week_start dates are not the 26 planning Mondays"
+    assert (pd.to_datetime(req["week_start"]).dt.dayofweek == 0).all(), "week_start must be a Monday"
+
+    # Quantities are whole numbers and never negative.
+    assert (req["gross_requirement_qty"] >= 0).all(), "Negative gross_requirement_qty"
+
+    # Only valid codes.
+    assert set(req["requirement_type"]) <= ALLOWED_REQUIREMENT_TYPES, "Invalid requirement_type"
+    assert set(req["priority"]) <= ALLOWED_PRIORITIES, "Invalid priority"
+    assert set(req["production_program"]) <= set(PROGRAMS), "Invalid production_program"
+
+    # SAFETY_STOCK rows (and only those) have zero quantity.
+    is_zero = req["gross_requirement_qty"] == 0
+    is_ss = req["requirement_type"] == "SAFETY_STOCK"
+    assert (is_zero == is_ss).all(), "SAFETY_STOCK must mean zero quantity, and zero quantity must be SAFETY_STOCK"
+
+    # A program can only create demand for materials in its bill of materials.
+    demand = req[~is_zero]
+    wrong_program = [
+        (m, p) for m, p in zip(demand["material_id"], demand["production_program"])
+        if p not in REQUIREMENT_BOM[m][0]
+    ]
+    assert not wrong_program, f"Demand from a program that does not use the material: {wrong_program[:5]}"
+
+    # Every material is used at least once in the horizon.
+    no_demand = set(materials["material_id"]) - set(demand["material_id"])
+    assert not no_demand, f"Materials with no demand at all: {no_demand}"
+
+
 # ---------------------------------------------------------------------------
-# 5. Main: build, check, save
+# 6. Main: build, check, save
 # ---------------------------------------------------------------------------
 
 def main():
+    # Order matters: everything shares one random number generator, so the
+    # master data is built first (exactly as in step 1) and requirements after.
     suppliers = build_supplier_master()
     materials = build_material_master(suppliers)
     validate(suppliers, materials)
 
+    schedule = build_production_schedule()
+    requirements = build_weekly_requirements(materials, schedule)
+    validate_requirements(requirements, materials)
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     suppliers.to_csv(OUTPUT_DIR / "supplier_master.csv", index=False)
     materials.to_csv(OUTPUT_DIR / "material_master.csv", index=False)
+    requirements.to_csv(OUTPUT_DIR / "weekly_requirements.csv", index=False)
 
     print(f"Wrote {len(suppliers)} suppliers -> {OUTPUT_DIR / 'supplier_master.csv'}")
     print(f"Wrote {len(materials)} materials -> {OUTPUT_DIR / 'material_master.csv'}")
+    print(f"Wrote {len(requirements)} weekly requirements -> {OUTPUT_DIR / 'weekly_requirements.csv'}")
     print("All validation checks passed.")
 
 
