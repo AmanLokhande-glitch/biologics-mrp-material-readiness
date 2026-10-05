@@ -1,0 +1,15 @@
+supplier_id,supplier_name,supplier_region,standard_lead_time,sole_source_flag,risk_rating,historical_otd_pct,quality_score
+SUP-001,Harborline Bioprocess Media,NORTH_AMERICA,28,Y,LOW,93.7,94
+SUP-002,Cedarvale Fine Chemicals,EUROPE,70,N,HIGH,80.6,87
+SUP-003,Northgate Resin Technologies,EUROPE,63,Y,HIGH,87.0,81
+SUP-004,Willowmere Biochem,EUROPE,49,N,MEDIUM,85.4,100
+SUP-005,Redfern Excipient Supply,NORTH_AMERICA,49,N,MEDIUM,96.5,89
+SUP-006,Ironwood Single-Use Systems,NORTH_AMERICA,126,Y,MEDIUM,90.9,98
+SUP-007,Brightwater Filtration Co.,EUROPE,49,Y,LOW,94.5,94
+SUP-008,Kestrel Fluid Path Assemblies,EUROPE,112,N,MEDIUM,86.9,96
+SUP-009,Lumenbridge Sensor Works,ASIA_PACIFIC,63,Y,HIGH,82.5,95
+SUP-010,Granite Peak Polymers,ASIA_PACIFIC,49,N,MEDIUM,89.1,84
+SUP-011,Silverbirch Glassworks,EUROPE,63,Y,HIGH,79.3,87
+SUP-012,Marlowe Closure Components,NORTH_AMERICA,98,N,MEDIUM,94.6,89
+SUP-013,Tidewell Label & Print,NORTH_AMERICA,77,N,MEDIUM,90.6,90
+SUP-014,Oakhaven Cartons & Cold Chain,NORTH_AMERICA,84,N,HIGH,93.2,80

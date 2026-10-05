@@ -13,6 +13,7 @@
    - The private/ folder must always be listed in .gitignore.
    - Describe the work as "SAP-style MRP concepts." Never claim this runs SAP S/4HANA.
    - Never commit or push without first showing me the list of files and waiting for my OK.
+   - If a file I point you to is missing or empty, stop and ask me before continuing.
 
    ## How to work with me
    - I am learning. After each task, explain what you did in simple words.
