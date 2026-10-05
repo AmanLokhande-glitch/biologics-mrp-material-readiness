@@ -1,16 +1,20 @@
 """
 generate_synthetic_data.py
 
-Build steps 1-2: create the master data and the weekly manufacturing
-requirements for the fictional company "Northstar Biologics Manufacturing".
+Build steps 1-3: create the master data, the weekly manufacturing
+requirements, and the opening batch inventory for the fictional company
+"Northstar Biologics Manufacturing".
 
-This script writes three CSV files:
+This script writes four CSV files:
     data/raw/supplier_master.csv     -> 14 fictional suppliers
     data/raw/material_master.csv     -> 60 materials (22 raw/process,
                                         23 single-use, 15 packaging)
     data/raw/weekly_requirements.csv -> 60 materials x 26 weeks = 1,560 rows
                                         of gross requirements, driven by a
                                         campaign production schedule
+    data/raw/inventory_batches.csv   -> 130-180 stock batches on hand at the
+                                        start of the plan, each with a
+                                        quality status (stock type)
 
 The columns follow section 6 of the project plan. They mirror SAP-style
 material planning parameters (procurement type, planned delivery time,
@@ -60,6 +64,11 @@ REQUIREMENT_COLUMNS = [
     "material_id", "week_start", "gross_requirement_qty", "requirement_type",
     "production_program", "priority",
 ]
+INVENTORY_COLUMNS = [
+    "material_id", "batch_id", "stock_type", "quantity", "goods_receipt_date",
+    "manufacture_date", "expiration_date", "expected_quality_release_date",
+    "storage_location",
+]
 
 # Allowed values for the coded fields.
 ALLOWED_REGIONS = {"NORTH_AMERICA", "EUROPE", "ASIA_PACIFIC"}
@@ -88,6 +97,13 @@ MAX_LEAD_TIME_GAP_DAYS = 14
 #                      planning need is to keep safety stock on hand
 ALLOWED_REQUIREMENT_TYPES = {"PRODUCTION", "SAFETY_STOCK", "PLANNED_CAMPAIGN"}
 ALLOWED_PRIORITIES = {"HIGH", "MEDIUM", "LOW"}
+
+# Stock types (SAP-style quality status of a batch):
+#   UNRESTRICTED       = released by Quality, free to use
+#   QUALITY_INSPECTION = received but still being tested; not usable until
+#                        its expected_quality_release_date
+#   BLOCKED            = on hold (e.g. failed inspection, damaged); never usable
+ALLOWED_STOCK_TYPES = {"UNRESTRICTED", "QUALITY_INSPECTION", "BLOCKED"}
 
 
 # ---------------------------------------------------------------------------
@@ -612,7 +628,166 @@ def build_weekly_requirements(materials, schedule):
 
 
 # ---------------------------------------------------------------------------
-# 5. Checks: make sure the data is valid before saving
+# 5. Opening inventory batches (build step 3)
+# ---------------------------------------------------------------------------
+
+# Opening inventory = the stock on hand on the first day of the plan.
+# Later steps (MRP, exception detection) reuse this date.
+INVENTORY_SNAPSHOT_DATE = PLANNING_START  # 2026-01-05
+
+# Last day of the planning horizon (the Sunday of week 26 = 2026-07-05).
+PLANNING_END = PLANNING_START + pd.Timedelta(weeks=N_WEEKS) - pd.Timedelta(days=1)
+
+# How many batches a material has on hand (1 to 5), and the chance of each.
+BATCH_COUNT_ODDS = {1: 0.15, 2: 0.30, 3: 0.30, 4: 0.15, 5: 0.10}
+
+# Released (UNRESTRICTED) stock covers safety stock + the demand of the next
+# 6 to 12 weeks (picked per material). 6 weeks = a tighter material,
+# 12 weeks = a comfortable one. Purchase orders (build step 4) cover the
+# weeks after that.
+COVERAGE_WEEKS_RANGE = (6, 12)
+
+# Chance that a material also holds one extra batch that is not usable yet.
+# Only materials with 2+ batches can have a QUALITY_INSPECTION batch, and only
+# materials with 3+ batches can have a BLOCKED batch, so every material keeps
+# at least one UNRESTRICTED batch.
+P_QUALITY_INSPECTION = 0.45
+P_BLOCKED = 0.20
+
+# Released batches were received at most this many days before the snapshot.
+MAX_DAYS_SINCE_RECEIPT = 120
+# Days between the supplier making a batch and us receiving it (min, max).
+MANUFACTURE_TO_RECEIPT_DAYS = (7, 60)
+
+# Fictional storage locations (4-character codes) and the storage condition
+# each one provides. CR = cold room, WH = ambient warehouse.
+STORAGE_LOCATIONS = {
+    "CR01": "2-8 C",    # cold room, raw/process materials
+    "CR02": "2-8 C",    # cold room, single-use components
+    "WH01": "15-25 C",  # ambient warehouse, raw/process materials
+    "WH02": "15-25 C",  # ambient warehouse, single-use components
+    "WH03": "15-25 C",  # ambient warehouse, packaging
+}
+# (storage_condition, material_category) -> storage location
+LOCATION_FOR = {
+    ("2-8 C", "RAW_PROCESS"): "CR01",
+    ("2-8 C", "SINGLE_USE"): "CR02",
+    ("15-25 C", "RAW_PROCESS"): "WH01",
+    ("15-25 C", "SINGLE_USE"): "WH02",
+    ("15-25 C", "PACKAGING"): "WH03",
+}
+
+# Columns that hold dates (written to the CSV as YYYY-MM-DD).
+INVENTORY_DATE_COLUMNS = [
+    "goods_receipt_date", "manufacture_date", "expiration_date",
+    "expected_quality_release_date",
+]
+
+
+def round_up_to_pack(qty, pack_size):
+    """Round a quantity up to a whole number of packs (at least one pack)."""
+    packs = max(1, math.ceil(round(qty, 6) / pack_size))
+    return int(packs * pack_size)
+
+
+def max_batch_age_days(material):
+    """
+    The oldest a batch may be (days from manufacture to the snapshot) and
+    still have its minimum remaining shelf life on the last day of the plan.
+    This keeps step 3 free of expiry problems; those are seeded in step 5.
+    """
+    days_to_plan_end = (PLANNING_END - INVENTORY_SNAPSHOT_DATE).days
+    return (material.shelf_life_days
+            - material.minimum_remaining_shelf_life_days
+            - days_to_plan_end)
+
+
+def build_inventory_batches(materials, requirements):
+    """Create the batches on hand on INVENTORY_SNAPSHOT_DATE (1-5 per material)."""
+    # material_id -> list of weekly demand, week 1 first.
+    weekly_demand = requirements.groupby("material_id")["gross_requirement_qty"].apply(list).to_dict()
+
+    rows = []
+
+    for material in materials.itertuples():
+        pack = material.rounding_value
+        location = LOCATION_FOR[(material.storage_condition, material.material_category)]
+
+        # --- 1. How many batches, and which ones are not usable yet --------
+        n_batches = int(rng.choice(list(BATCH_COUNT_ODDS), p=list(BATCH_COUNT_ODDS.values())))
+        has_qi = n_batches >= 2 and rng.random() < P_QUALITY_INSPECTION
+        has_blocked = n_batches >= 3 and rng.random() < P_BLOCKED
+        n_unrestricted = n_batches - int(has_qi) - int(has_blocked)
+
+        # --- 2. Released stock: safety stock + demand of the next N weeks,
+        #        split at random over the UNRESTRICTED batches ---------------
+        coverage_weeks = int(rng.integers(*COVERAGE_WEEKS_RANGE, endpoint=True))
+        target_qty = material.safety_stock_qty + sum(weekly_demand[material.material_id][:coverage_weeks])
+        shares = rng.dirichlet([2.0] * n_unrestricted)  # random shares that add up to 1
+        stock_types = ["UNRESTRICTED"] * n_unrestricted
+        quantities = [round_up_to_pack(target_qty * share, pack) for share in shares]
+
+        # --- 3. Extra stock on top of that, not usable on the snapshot date -
+        if has_qi:
+            # A recent delivery still being tested: half to one MOQ.
+            quantities.append(round_up_to_pack(material.minimum_order_qty * rng.uniform(0.5, 1.0), pack))
+            stock_types.append("QUALITY_INSPECTION")
+        if has_blocked:
+            # A small lot on hold: 10% to 30% of an MOQ.
+            quantities.append(round_up_to_pack(material.minimum_order_qty * rng.uniform(0.1, 0.3), pack))
+            stock_types.append("BLOCKED")
+
+        # --- 4. Dates for each batch -----------------------------------------
+        max_age = max_batch_age_days(material)
+        batches = []
+        for stock_type, qty in zip(stock_types, quantities):
+            if stock_type == "QUALITY_INSPECTION":
+                # Received in the last few days, so goods-receipt testing
+                # (gr_processing_days) is not finished on the snapshot date.
+                days_since_receipt = int(rng.integers(0, material.gr_processing_days - 1, endpoint=True))
+            else:
+                # Received long enough ago for testing to be finished.
+                latest = min(MAX_DAYS_SINCE_RECEIPT, max_age - MANUFACTURE_TO_RECEIPT_DAYS[0])
+                days_since_receipt = int(rng.integers(material.gr_processing_days, latest, endpoint=True))
+
+            # The supplier made the batch 7-60 days before we received it,
+            # but never so early that it would be too old by the plan end.
+            lag_max = min(MANUFACTURE_TO_RECEIPT_DAYS[1], max_age - days_since_receipt)
+            lag = int(rng.integers(MANUFACTURE_TO_RECEIPT_DAYS[0], lag_max, endpoint=True))
+
+            gr_date = INVENTORY_SNAPSHOT_DATE - pd.Timedelta(days=days_since_receipt)
+            manufacture_date = gr_date - pd.Timedelta(days=lag)
+
+            if stock_type == "QUALITY_INSPECTION":
+                release_date = gr_date + pd.Timedelta(days=material.gr_processing_days)
+            else:
+                release_date = pd.NaT  # left blank in the CSV
+
+            batches.append({
+                "material_id": material.material_id,
+                "stock_type": stock_type,
+                "quantity": qty,
+                "goods_receipt_date": gr_date,
+                "manufacture_date": manufacture_date,
+                "expiration_date": manufacture_date + pd.Timedelta(days=material.shelf_life_days),
+                "expected_quality_release_date": release_date,
+                "storage_location": location,
+            })
+
+        # --- 5. Number the batches oldest first: RM-001-B01, RM-001-B02 ... --
+        batches.sort(key=lambda batch: batch["goods_receipt_date"])
+        for seq, batch in enumerate(batches, start=1):
+            batch["batch_id"] = f"{material.material_id}-B{seq:02d}"
+        rows.extend(batches)
+
+    df = pd.DataFrame(rows)
+    for col in INVENTORY_DATE_COLUMNS:
+        df[col] = df[col].dt.strftime("%Y-%m-%d")  # NaT stays empty
+    return df[INVENTORY_COLUMNS]
+
+
+# ---------------------------------------------------------------------------
+# 6. Checks: make sure the data is valid before saving
 # ---------------------------------------------------------------------------
 
 def validate(suppliers, materials):
@@ -751,13 +926,98 @@ def validate_requirements(requirements, materials):
     assert not no_demand, f"Materials with no demand at all: {no_demand}"
 
 
+def validate_inventory(batches, materials, requirements):
+    """Stop with an error if the opening inventory breaks a basic rule."""
+    b = batches
+    snapshot = INVENTORY_SNAPSHOT_DATE
+
+    # Material master fields, lined up with each batch row.
+    master = materials.set_index("material_id")
+    shelf_life = pd.to_timedelta(b["material_id"].map(master["shelf_life_days"]), unit="D")
+    gr_processing = pd.to_timedelta(b["material_id"].map(master["gr_processing_days"]), unit="D")
+    min_life_days = b["material_id"].map(master["minimum_remaining_shelf_life_days"])
+
+    # Shape: planned columns, 130-180 batches, unique IDs.
+    assert list(b.columns) == INVENTORY_COLUMNS, "Inventory columns do not match the plan"
+    assert 130 <= len(b) <= 180, f"Expected 130-180 batches, got {len(b)}"
+    assert b["batch_id"].is_unique, "Duplicate batch_id"
+
+    # Every material_id exists in the master; every material has 1-5 batches.
+    unknown = set(b["material_id"]) - set(materials["material_id"])
+    assert not unknown, f"Unknown material_id(s): {unknown}"
+    per_material = b.groupby("material_id").size()
+    assert len(per_material) == 60, "Every material needs at least one batch"
+    assert per_material.between(1, 5).all(), "Each material must have 1-5 batches"
+
+    # Valid codes, positive quantities, nothing missing (except release date).
+    assert set(b["stock_type"]) <= ALLOWED_STOCK_TYPES, "Invalid stock_type"
+    assert (b["quantity"] > 0).all(), "Batch quantity must be > 0"
+    assert not b.drop(columns="expected_quality_release_date").isna().any().any(), \
+        "Missing values in inventory_batches"
+
+    # Most batches are released, fewer are in testing, only a few are blocked.
+    counts = b["stock_type"].value_counts()
+    assert counts.get("UNRESTRICTED", 0) > len(b) / 2, "Most batches should be UNRESTRICTED"
+    assert counts.get("QUALITY_INSPECTION", 0) > counts.get("BLOCKED", 0) >= 1, \
+        "Expect more QUALITY_INSPECTION batches than BLOCKED ones, and at least one BLOCKED"
+
+    # --- Date rules ---------------------------------------------------------
+    gr_date = pd.to_datetime(b["goods_receipt_date"])
+    mfg_date = pd.to_datetime(b["manufacture_date"])
+    exp_date = pd.to_datetime(b["expiration_date"])
+    release_date = pd.to_datetime(b["expected_quality_release_date"])
+    is_qi = b["stock_type"] == "QUALITY_INSPECTION"
+
+    assert (mfg_date < gr_date).all(), "manufacture_date must be before goods_receipt_date"
+    assert (gr_date <= snapshot).all(), "goods_receipt_date must be on or before the snapshot date"
+    assert (exp_date == mfg_date + shelf_life).all(), "expiration_date must be manufacture_date + shelf_life_days"
+
+    # QUALITY_INSPECTION: release date = receipt + GR processing time, after the snapshot.
+    assert release_date[is_qi].notna().all(), "QUALITY_INSPECTION batch missing release date"
+    assert (release_date[is_qi] == gr_date[is_qi] + gr_processing[is_qi]).all(), \
+        "Release date must be goods_receipt_date + gr_processing_days"
+    assert (release_date[is_qi] > snapshot).all(), "QUALITY_INSPECTION release date must be after the snapshot"
+
+    # UNRESTRICTED / BLOCKED: no release date, and testing finished before the snapshot.
+    assert release_date[~is_qi].isna().all(), "Only QUALITY_INSPECTION batches may have a release date"
+    assert (gr_date[~is_qi] + gr_processing[~is_qi] <= snapshot).all(), \
+        "UNRESTRICTED/BLOCKED batches must have finished goods-receipt processing"
+
+    # Storage location must provide the material's storage condition.
+    location_condition = b["storage_location"].map(STORAGE_LOCATIONS)
+    material_condition = b["material_id"].map(master["storage_condition"])
+    wrong_place = b[location_condition != material_condition]
+    assert wrong_place.empty, f"Wrong storage location for: {list(wrong_place['batch_id'])}"
+
+    # --- No problems seeded yet (that is build step 5) ----------------------
+    # No expiry problem: every batch still has its minimum remaining shelf
+    # life on the last day of the plan.
+    life_left_at_end = (exp_date - PLANNING_END).dt.days
+    assert (life_left_at_end >= min_life_days).all(), "A batch would breach minimum remaining shelf life"
+
+    # No shortage, safety-stock breach, or quality hold early on: released
+    # stock alone covers safety stock + demand for the shortest coverage
+    # window. (Quality-inspection stock releases within 14 days, inside this
+    # window, so it can not hold up demand either.)
+    first_weeks_end = PLANNING_START + pd.Timedelta(weeks=COVERAGE_WEEKS_RANGE[0])
+    early = requirements[pd.to_datetime(requirements["week_start"]) < first_weeks_end]
+    early_demand = early.groupby("material_id")["gross_requirement_qty"].sum()
+    released = b[b["stock_type"] == "UNRESTRICTED"].groupby("material_id")["quantity"].sum()
+    needed = master["safety_stock_qty"] + early_demand.reindex(master.index, fill_value=0)
+    short = needed[released.reindex(master.index, fill_value=0) < needed]
+    assert short.empty, f"Opening stock does not cover the first weeks for: {list(short.index)}"
+    assert (release_date[is_qi] < first_weeks_end).all(), "Quality release falls outside the covered weeks"
+
+
 # ---------------------------------------------------------------------------
-# 6. Main: build, check, save
+# 7. Main: build, check, save
 # ---------------------------------------------------------------------------
 
 def main():
     # Order matters: everything shares one random number generator, so the
-    # master data is built first (exactly as in step 1) and requirements after.
+    # master data is built first (exactly as in step 1), then requirements
+    # (step 2), then inventory (step 3). New steps go at the end, so the
+    # files from earlier steps stay exactly the same.
     suppliers = build_supplier_master()
     materials = build_material_master(suppliers)
     validate(suppliers, materials)
@@ -766,14 +1026,19 @@ def main():
     requirements = build_weekly_requirements(materials, schedule)
     validate_requirements(requirements, materials)
 
+    inventory = build_inventory_batches(materials, requirements)
+    validate_inventory(inventory, materials, requirements)
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     suppliers.to_csv(OUTPUT_DIR / "supplier_master.csv", index=False)
     materials.to_csv(OUTPUT_DIR / "material_master.csv", index=False)
     requirements.to_csv(OUTPUT_DIR / "weekly_requirements.csv", index=False)
+    inventory.to_csv(OUTPUT_DIR / "inventory_batches.csv", index=False)
 
     print(f"Wrote {len(suppliers)} suppliers -> {OUTPUT_DIR / 'supplier_master.csv'}")
     print(f"Wrote {len(materials)} materials -> {OUTPUT_DIR / 'material_master.csv'}")
     print(f"Wrote {len(requirements)} weekly requirements -> {OUTPUT_DIR / 'weekly_requirements.csv'}")
+    print(f"Wrote {len(inventory)} inventory batches -> {OUTPUT_DIR / 'inventory_batches.csv'}")
     print("All validation checks passed.")
 
 
